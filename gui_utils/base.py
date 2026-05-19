@@ -214,6 +214,11 @@ class GUIBase:
         self._drag_start_center = [0.5, 0.5]
 
         # ------------------------------------------------------------------ #
+        # Save options
+        # ------------------------------------------------------------------ #
+        self.save_fp16 = False
+
+        # ------------------------------------------------------------------ #
         # Misc
         # ------------------------------------------------------------------ #
         self.save_frame = False
@@ -289,9 +294,13 @@ class GUIBase:
     def process_all(self):
         """Run the loaded model on every image in the dataset and save raw outputs.
 
-        Outputs go to <parent_of_dataset_dir>/predictions/ as .npy files
-        (same stem as the source image). Raw model output is saved — NOT the
-        colorized display version — so you can post-process freely.
+        Outputs go to <parent_of_dataset_dir>/predictions/ as .pt files
+        (same stem as the source image). Raw CPU tensor is saved — NOT the
+        colorized display version. Use `torch.load(path, map_location='cuda')`
+        to bring it straight onto the GPU.
+
+        If `self.save_fp16` is True, tensors are cast to float16 before saving
+        (~2x smaller, ~2x faster host->device transfer).
         """
         if self.model is None or self.model_entry is None:
             dpg.set_value("_log_model_status", "No model loaded.")
@@ -305,7 +314,8 @@ class GUIBase:
         parent_dir = os.path.dirname(dataset_dir)
         out_dir = os.path.join(parent_dir, "predictions")
         os.makedirs(out_dir, exist_ok=True)
-        print(f"[process_all] Saving to {out_dir}")
+        dtype_str = "fp16" if self.save_fp16 else "fp32"
+        print(f"[process_all] Saving to {out_dir} as .pt ({dtype_str})")
 
         n = len(self.image_paths)
         ok = 0
@@ -315,9 +325,6 @@ class GUIBase:
         for i, path in enumerate(self.image_paths):
             dpg.set_value("_log_model_status",
                           f"Processing {i+1}/{n}: {os.path.basename(path)}")
-            # Force a redraw of the status line each frame, even though we're
-            # inside a callback — DPG batches set_value updates, but the user
-            # at least sees the final state.
             try:
                 img = cv2.imread(path, cv2.IMREAD_COLOR)
                 if img is None:
@@ -325,16 +332,20 @@ class GUIBase:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 chw = to_tensor(img)
                 y = self.model_entry["predict"](self.model, chw, self.device)
-                arr = y.detach().cpu().numpy() if torch.is_tensor(y) else np.asarray(y)
+                if not torch.is_tensor(y):
+                    y = torch.as_tensor(y)
+                tensor = y.detach().cpu().contiguous()
+                if self.save_fp16:
+                    tensor = tensor.to(torch.float16)
                 stem = os.path.splitext(os.path.basename(path))[0]
-                np.save(os.path.join(out_dir, stem + ".npy"), arr)
+                torch.save(tensor, os.path.join(out_dir, stem + ".pt"))
                 ok += 1
             except Exception as e:
                 print(f"[process_all] {path}: {e}")
                 fail += 1
 
         dt = time.time() - t_start
-        msg = f"Done: {ok} saved, {fail} failed, {dt:.1f}s -> {out_dir}"
+        msg = f"Done: {ok} saved, {fail} failed, {dt:.1f}s ({dtype_str}) -> {out_dir}"
         print(f"[process_all] {msg}")
         dpg.set_value("_log_model_status", msg)
 
@@ -495,6 +506,13 @@ class GUIBase:
     def _cb_process_all(self, sender, app_data):
         self.process_all()
 
+    def _cb_toggle_fp16(self, sender, app_data):
+        self.save_fp16 = not self.save_fp16
+        label = "FP16: ON" if self.save_fp16 else "FP16: OFF"
+        dpg.set_item_label("_btn_fp16", label)
+        theme = "_theme_btn_on" if self.save_fp16 else "_theme_btn_off"
+        dpg.bind_item_theme("_btn_fp16", theme)
+
     # ====================================================================== #
     # Rendering
     # ====================================================================== #
@@ -550,6 +568,22 @@ class GUIBase:
     # DPG registration
     # ====================================================================== #
     def register_dpg(self):
+        # ---------- toggle button themes (used by FP16 toggle) ----------
+        with dpg.theme(tag="_theme_btn_on"):
+            with dpg.theme_component(dpg.mvButton):
+                # green when active
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (40, 140, 60))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (55, 170, 75))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (30, 110, 50))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255))
+        with dpg.theme(tag="_theme_btn_off"):
+            with dpg.theme_component(dpg.mvButton):
+                # subdued gray when inactive
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (60, 60, 60))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (85, 85, 85))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (45, 45, 45))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (200, 200, 200))
+
         with dpg.texture_registry(show=False):
             dpg.add_raw_texture(self.MAIN_W, self.MAIN_H, self.buffer_main,
                                 format=dpg.mvFormat_Float_rgb, tag="_tex_main")
@@ -599,6 +633,11 @@ class GUIBase:
                                callback=self._cb_predict)
             dpg.add_button(label="Process all -> predictions/",
                            width=-1, callback=self._cb_process_all)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Save dtype: ")
+                dpg.add_button(label="FP16: OFF", tag="_btn_fp16",
+                               width=120, callback=self._cb_toggle_fp16)
+            dpg.bind_item_theme("_btn_fp16", "_theme_btn_off")
             dpg.add_text("(no model loaded)", tag="_log_model_status")
             dpg.add_separator()
 
