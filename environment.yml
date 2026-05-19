@@ -1,0 +1,82 @@
+# Conda environment compatible with:
+#   - DINOv3 (requires PyTorch >= 2.7.1, Python 3.11, Linux)
+#   - Depth Anything V2 (lighter constraints; works with the above)
+#
+# Target: CUDA 12.4 (PyTorch cu124 wheels work on driver >= 525)
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate DLviewer
+#
+# After creation, clone the repos somewhere on your PYTHONPATH and download
+# weights. See the notes at the bottom.
+
+name: DLviewer
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.11
+
+  # ---- system / build ----
+  - pip
+  - git
+  - ninja
+
+  # ---- core scientific stack ----
+  - numpy
+  - scipy
+  - matplotlib
+  - pillow
+  - tqdm
+  - pyyaml
+  - h5py
+
+  # ---- pip-installed packages ----
+  - pip:
+      # PyTorch 2.7.1 with CUDA 12.4 (satisfies DINOv3's >= 2.7.1 requirement)
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.7.1
+      - torchvision==0.22.1
+      - torchaudio==2.7.1
+
+      # ---- Depth Anything V2 deps (from its requirements.txt) ----
+      - opencv-python
+      - gradio_imageslider
+      - gradio==4.29.0
+      - einops
+      - timm
+
+      # ---- DINOv3 deps (covers the HF Transformers path and hub.load path) ----
+      # DINOv3 ViT support landed in transformers 4.56
+      - transformers>=4.56.0
+      - accelerate
+      - safetensors
+      - huggingface_hub
+      - xformers==0.0.31        # matches torch 2.7.1; speeds up DINOv3
+      - omegaconf
+      - fvcore
+      - iopath
+      - submitit                 # for DINOv3's distributed launcher (optional)
+
+      # ---- nice-to-have for the viewer GUI ----
+      - dearpygui
+      - psutil
+
+# ----------------------------------------------------------------------------
+# Post-install steps (run after `conda activate DLviewer`):
+#
+# 1. UniDepth V2
+#    git clone git clone https://github.com/lpiccinelli-eth/UniDepth.git
+#    cd UniDepth
+#    pip install -e .
+#
+# 2. DINOv3
+#    git clone https://github.com/facebookresearch/dinov3
+#    cd dinov3
+#    pip install -e .
+#    # Request DINOv3 weights from the official download portal and pass the
+#    # path/URL to torch.hub.load(..., weights=...).
