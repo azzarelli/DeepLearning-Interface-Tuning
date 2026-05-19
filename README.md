@@ -47,6 +47,13 @@ pip install -e .
 
 ## You will need to wget the checkpoints and place then in `checkpoints/` for the vit s, b and l models 
 
+# For Depth-Anything-3 from root
+git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git --recursive
+cd Depth-Anything-3
+pip install -e .
+
+## You will also need to install the Depth-Anything-3/da3_streaming/` dependency for finetuning COLMAP poses and refining the initial point cloud
+
 ```
 
 # Run and Downstream Use

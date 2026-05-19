@@ -398,6 +398,81 @@ MODEL_REGISTRY.extend([
 ])
 
 
+# --------------------------------------------------------------------------- #
+# Depth Anything 3 (single-image inference via the official Python API)
+# --------------------------------------------------------------------------- #
+# These entries are for the live "Predict" button. For consistent depth across
+# 1500+ frames, use the "Consistent batch (DA3-Streaming)" panel which spawns
+# the official streaming CLI as a subprocess.
+
+def _load_da3(device, repo_id="depth-anything/DA3-Large"):
+    """Load a Depth Anything 3 model via its `from_pretrained` API."""
+    local_clone = os.path.abspath("Depth-Anything-3")
+    if os.path.isdir(local_clone):
+        src = os.path.join(local_clone, "src")
+        if os.path.isdir(src) and src not in sys.path:
+            sys.path.insert(0, src)
+        if local_clone not in sys.path:
+            sys.path.insert(0, local_clone)
+    try:
+        from depth_anything_3.api import DepthAnything3
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not import depth_anything_3. Clone the repo into "
+            f"./Depth-Anything-3 or `pip install depth-anything-3`. ({e})")
+
+    model = DepthAnything3.from_pretrained(repo_id)
+    model = model.to(device).eval()
+    return model
+
+
+@torch.no_grad()
+def _predict_da3(model, chw_float01, device):
+    """Single-image DA3 inference. Returns HxW float depth on CPU."""
+    import tempfile
+    H, W = chw_float01.shape[1], chw_float01.shape[2]
+    rgb_u8 = (chw_float01.clamp(0, 1) * 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+    bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        cv2.imwrite(tmp.name, bgr)
+        try:
+            pred = model.inference(images=[tmp.name])
+        finally:
+            try: os.unlink(tmp.name)
+            except Exception: pass
+
+    depth = np.asarray(pred.depth)
+    if depth.ndim == 3:
+        depth = depth[0]
+    if depth.shape != (H, W):
+        depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
+    return torch.from_numpy(depth).float()
+
+
+MODEL_REGISTRY.extend([
+    {
+        "name":    "DA3 (Large) - single image",
+        "load":    lambda dev: _load_da3(dev, "depth-anything/DA3-Large"),
+        "predict": _predict_da3,
+    },
+    {
+        "name":    "DA3 (Base) - single image",
+        "load":    lambda dev: _load_da3(dev, "depth-anything/DA3-Base"),
+        "predict": _predict_da3,
+    },
+    {
+        "name":    "DA3 (Small) - single image",
+        "load":    lambda dev: _load_da3(dev, "depth-anything/DA3-Small"),
+        "predict": _predict_da3,
+    },
+    {
+        "name":    "DA3 Metric (Large) - single image",
+        "load":    lambda dev: _load_da3(dev, "depth-anything/DA3Metric-Large"),
+        "predict": _predict_da3,
+    },
+])
+
+
 def _colorize_depth(depth_hw, invert=True, cmap=cv2.COLORMAP_TURBO,
                     pct_lo=2.0, pct_hi=98.0):
     """Map a HxW float depth tensor to a CxHxW RGB tensor in [0,1].
@@ -432,6 +507,424 @@ def _colorize_depth(depth_hw, invert=True, cmap=cv2.COLORMAP_TURBO,
     colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
     chw = torch.from_numpy(colored).permute(2, 0, 1).float() / 255.0
     return chw
+
+
+# --------------------------------------------------------------------------- #
+# COLMAP binary readers + per-frame least-squares scale/shift refinement
+# --------------------------------------------------------------------------- #
+# Format reference: https://colmap.github.io/format.html
+# We only read the fields we actually need (camera intrinsics, image poses,
+# 2D-3D correspondences, 3D point coordinates). Code adapted from the standard
+# colmap/scripts/python/read_write_model.py logic.
+
+import struct as _struct
+
+
+def _colmap_read_next_bytes(fid, num_bytes, format_char_sequence, endian="<"):
+    data = fid.read(num_bytes)
+    return _struct.unpack(endian + format_char_sequence, data)
+
+
+def _colmap_read_cameras_bin(path):
+    """Returns dict: camera_id -> (model, width, height, params [fx, fy, cx, cy, ...])."""
+    cameras = {}
+    with open(path, "rb") as f:
+        num = _colmap_read_next_bytes(f, 8, "Q")[0]
+        for _ in range(num):
+            cam_id, model_id, w, h = _colmap_read_next_bytes(f, 24, "iiQQ")
+            # Number of params depends on model; here we read until next camera
+            # Model param counts (subset): SIMPLE_PINHOLE=3, PINHOLE=4, RADIAL=5,
+            # OPENCV=8, OPENCV_FISHEYE=8, FULL_OPENCV=12, ...
+            param_counts = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5,
+                            8: 4, 9: 5, 10: 12}
+            n_params = param_counts.get(model_id, 4)
+            params = _colmap_read_next_bytes(f, 8 * n_params, "d" * n_params)
+            cameras[cam_id] = {
+                "model_id": model_id, "width": w, "height": h,
+                "params": np.array(params, dtype=np.float64),
+            }
+    return cameras
+
+
+def _colmap_qvec_to_R(qvec):
+    """COLMAP stores quaternions as (w, x, y, z). Returns 3x3 rotation matrix."""
+    w, x, y, z = qvec
+    return np.array([
+        [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+        [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+        [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y],
+    ], dtype=np.float64)
+
+
+def _colmap_read_images_bin(path):
+    """Returns dict: image_id -> dict(name, R, t, point3D_ids [array of int])."""
+    images = {}
+    with open(path, "rb") as f:
+        num = _colmap_read_next_bytes(f, 8, "Q")[0]
+        for _ in range(num):
+            img_id, *qt, cam_id = _colmap_read_next_bytes(f, 64, "idddddddi")
+            qvec = np.array(qt[:4], dtype=np.float64)
+            tvec = np.array(qt[4:7], dtype=np.float64)
+            # Image name (null-terminated string)
+            name = b""
+            while True:
+                ch = f.read(1)
+                if ch == b"\x00":
+                    break
+                name += ch
+            name = name.decode("utf-8")
+            n_pts2d = _colmap_read_next_bytes(f, 8, "Q")[0]
+            # Each 2D point: (x, y, point3D_id). We only care about point3D_id.
+            arr = _colmap_read_next_bytes(f, 24 * n_pts2d, "ddq" * n_pts2d) if n_pts2d else ()
+            xys = np.array(arr, dtype=np.float64).reshape(-1, 3) if n_pts2d else np.zeros((0, 3))
+            images[img_id] = {
+                "name": name, "camera_id": cam_id,
+                "R": _colmap_qvec_to_R(qvec), "t": tvec,
+                "xys": xys[:, :2] if n_pts2d else np.zeros((0, 2)),
+                "point3D_ids": xys[:, 2].astype(np.int64) if n_pts2d else np.zeros((0,), dtype=np.int64),
+            }
+    return images
+
+
+def _colmap_read_points3d_bin(path):
+    """Returns dict: point3D_id -> xyz (np.float64 length 3)."""
+    pts = {}
+    with open(path, "rb") as f:
+        num = _colmap_read_next_bytes(f, 8, "Q")[0]
+        for _ in range(num):
+            pid, x, y, z, r, g, b, err = _colmap_read_next_bytes(f, 43, "QdddBBBd")
+            n_track = _colmap_read_next_bytes(f, 8, "Q")[0]
+            f.read(8 * n_track)   # skip track (image_id, point2D_idx) pairs
+            pts[pid] = np.array([x, y, z], dtype=np.float64)
+    return pts
+
+
+def _project_points_to_frame(pts3d_world, R_wc, t_wc, K, W, H):
+    """Project 3D world points into a camera, return Nx3 (u, v, z_cam) for valid ones."""
+    cam = (R_wc @ pts3d_world.T).T + t_wc   # (N, 3) in camera frame
+    z = cam[:, 2]
+    valid = z > 1e-3
+    cam = cam[valid]
+    uv = cam[:, :2] / cam[:, 2:3]
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    u = uv[:, 0] * fx + cx
+    v = uv[:, 1] * fy + cy
+    inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    return np.stack([u[inside], v[inside], cam[inside, 2]], axis=1)
+
+
+def _intrinsic_matrix_from_colmap(cam):
+    """Build a 3x3 K from a COLMAP camera record (PINHOLE / SIMPLE_PINHOLE)."""
+    p = cam["params"]
+    model = cam["model_id"]
+    if model == 0:   # SIMPLE_PINHOLE: f, cx, cy
+        fx = fy = p[0]; cx, cy = p[1], p[2]
+    elif model == 1: # PINHOLE: fx, fy, cx, cy
+        fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+    else:
+        # Other models: first 4 params are usually fx, fy, cx, cy or close enough
+        fx, fy, cx, cy = p[0], p[0] if len(p) < 4 else p[1], p[1 if model == 0 else 2], p[2 if model == 0 else 3]
+    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
+
+def _fit_scale_shift_lsq(d_pred_vec, z_gt_vec):
+    """Solve d_gt = s * d_pred + t in least squares. Returns (s, t)."""
+    if len(d_pred_vec) < 2:
+        return 1.0, 0.0
+    A = np.stack([d_pred_vec, np.ones_like(d_pred_vec)], axis=1)
+    sol, *_ = np.linalg.lstsq(A, z_gt_vec, rcond=None)
+    return float(sol[0]), float(sol[1])
+
+
+def refine_depths_with_colmap(predictions_dir, image_paths, colmap_sparse_dir,
+                              status_cb=None):
+    """For every .pt file in predictions_dir, fit a scale+shift using COLMAP
+    sparse points visible in that frame, and overwrite the file.
+
+    Args:
+        predictions_dir: directory of *.pt files (one per source image stem).
+        image_paths:     list of source image paths (used to match stems).
+        colmap_sparse_dir: dir containing cameras.bin, images.bin, points3D.bin.
+        status_cb:       optional callable(str) for progress messages.
+    """
+    cam_bin = os.path.join(colmap_sparse_dir, "cameras.bin")
+    img_bin = os.path.join(colmap_sparse_dir, "images.bin")
+    pts_bin = os.path.join(colmap_sparse_dir, "points3D.bin")
+    for p in (cam_bin, img_bin, pts_bin):
+        if not os.path.isfile(p):
+            raise RuntimeError(f"Missing COLMAP file: {p}")
+
+    if status_cb: status_cb("Reading COLMAP cameras/images/points...")
+    cameras = _colmap_read_cameras_bin(cam_bin)
+    images = _colmap_read_images_bin(img_bin)
+    points3d = _colmap_read_points3d_bin(pts_bin)
+
+    # Build basename -> COLMAP image record
+    name_to_record = {os.path.basename(rec["name"]): rec for rec in images.values()}
+
+    # Build basename -> source image path
+    name_to_path = {os.path.basename(p): p for p in image_paths}
+
+    refined_ok = 0
+    skipped = 0
+    matched_files = sorted(glob.glob(os.path.join(predictions_dir, "*.pt")))
+    for k, pt_path in enumerate(matched_files):
+        stem = os.path.splitext(os.path.basename(pt_path))[0]
+        # Find matching COLMAP record (try a few extensions)
+        rec = None
+        for ext in (".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff", ".JPG", ".PNG"):
+            if (stem + ext) in name_to_record:
+                rec = name_to_record[stem + ext]
+                break
+        if rec is None:
+            skipped += 1
+            continue
+
+        if status_cb and k % 25 == 0:
+            status_cb(f"Refining {k+1}/{len(matched_files)} ({refined_ok} ok)")
+
+        K = _intrinsic_matrix_from_colmap(cameras[rec["camera_id"]])
+        H_cam = cameras[rec["camera_id"]]["height"]
+        W_cam = cameras[rec["camera_id"]]["width"]
+
+        # Gather 3D points seen in this frame
+        ids = rec["point3D_ids"]
+        valid_ids = ids[ids >= 0]
+        if len(valid_ids) < 8:
+            skipped += 1
+            continue
+        pts3d = np.array([points3d[i] for i in valid_ids if i in points3d])
+        if pts3d.shape[0] < 8:
+            skipped += 1
+            continue
+
+        # Project, sample predicted depth at those pixels
+        proj = _project_points_to_frame(pts3d, rec["R"], rec["t"], K, W_cam, H_cam)
+        if proj.shape[0] < 8:
+            skipped += 1
+            continue
+
+        depth = torch.load(pt_path, map_location="cpu", weights_only=False)
+        if isinstance(depth, dict):  # in case anyone stored a dict
+            depth = depth.get("depth", depth)
+        depth = depth.float()
+        # Depth may have been saved at a different resolution than the COLMAP cam.
+        # Resize proj coords to depth resolution if needed.
+        dH, dW = depth.shape[-2:]
+        if (dH, dW) != (H_cam, W_cam):
+            proj[:, 0] *= dW / W_cam
+            proj[:, 1] *= dH / H_cam
+
+        u = np.clip(proj[:, 0].astype(int), 0, dW - 1)
+        v = np.clip(proj[:, 1].astype(int), 0, dH - 1)
+        d_pred = depth.numpy()[v, u].astype(np.float64)
+        z_gt   = proj[:, 2]
+        finite = np.isfinite(d_pred) & np.isfinite(z_gt) & (d_pred > 0)
+        if finite.sum() < 8:
+            skipped += 1
+            continue
+        s, t = _fit_scale_shift_lsq(d_pred[finite], z_gt[finite])
+        refined = (depth.float() * s + t)
+        torch.save(refined.contiguous(), pt_path)
+        refined_ok += 1
+
+    if status_cb:
+        status_cb(f"Refinement done: {refined_ok} ok, {skipped} skipped.")
+    return refined_ok, skipped
+
+
+# --------------------------------------------------------------------------- #
+# DA3-Streaming subprocess wrapper
+# --------------------------------------------------------------------------- #
+def _find_da3_streaming_script():
+    """Locate da3_streaming.py from the local Depth-Anything-3 clone."""
+    for cand in (
+        os.path.join("Depth-Anything-3", "da3_streaming", "da3_streaming.py"),
+        os.path.join("Depth-Anything-3", "da3_streaming.py"),
+    ):
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+def run_da3_streaming(image_dir, out_dir, chunk_size=60, save_results=True,
+                      python_exe=None, log_cb=None):
+    """Launch DA3-Streaming as a subprocess. Returns the Popen object.
+
+    DA3-Streaming's CLI only accepts --image_dir, --config, --output_dir.
+    Knobs like chunk_size / overlap live in the YAML config (nested under
+    `Model:`), so we load the default config, patch the relevant keys, write
+    a temp YAML, and pass that via --config.
+    """
+    import subprocess, tempfile
+    try:
+        import yaml
+    except ImportError:
+        raise RuntimeError("PyYAML is required. `pip install pyyaml`.")
+
+    script = _find_da3_streaming_script()
+    if script is None:
+        raise RuntimeError(
+            "Could not find da3_streaming.py. Clone the DA3 repo with "
+            "--recursive into ./Depth-Anything-3 and ensure the da3_streaming/ "
+            "subfolder exists.")
+
+    streaming_dir = os.path.dirname(script)
+    default_cfg = os.path.join(streaming_dir, "configs", "base_config.yaml")
+    if not os.path.isfile(default_cfg):
+        raise RuntimeError(f"DA3-Streaming default config not found at {default_cfg}")
+
+    # Load default config as a dict
+    with open(default_cfg, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    # Apply overrides. The schema (as of Dec 2025) nests both chunk_size and
+    # overlap under `Model:`. overlap MUST be strictly less than chunk_size.
+    if "Model" not in cfg or not isinstance(cfg["Model"], dict):
+        cfg["Model"] = {}
+    if chunk_size is not None:
+        cs = int(chunk_size)
+        cfg["Model"]["chunk_size"] = cs
+        cfg["Model"]["overlap"] = max(1, cs // 2)   # half, clamped > 0
+    if save_results:
+        cfg["Model"]["save_depth_conf_result"] = True
+
+    # Sanity check: overlap < chunk_size or DA3-Streaming will refuse to run
+    if cfg["Model"].get("overlap", 0) >= cfg["Model"].get("chunk_size", 1):
+        cfg["Model"]["overlap"] = max(1, cfg["Model"]["chunk_size"] - 1)
+
+    # Write the patched config to a temp file inside configs/ so any relative
+    # paths inside the YAML still resolve from the streaming dir cwd.
+    tmp_cfg = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False,
+        dir=os.path.join(streaming_dir, "configs"))
+    yaml.safe_dump(cfg, tmp_cfg, sort_keys=False)
+    tmp_cfg.close()
+    tmp_cfg_path = tmp_cfg.name
+
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [
+        python_exe or sys.executable, "-u", script,
+        "--image_dir",  os.path.abspath(image_dir),
+        "--output_dir", os.path.abspath(out_dir),
+        "--config",     tmp_cfg_path,
+    ]
+
+    if log_cb:
+        log_cb(f"Config: chunk_size={cfg['Model'].get('chunk_size')}, "
+               f"overlap={cfg['Model'].get('overlap')}, "
+               f"save_depth_conf_result={cfg['Model'].get('save_depth_conf_result')}")
+        log_cb("Launching: " + " ".join(cmd))
+
+    # Pass an env with expandable_segments enabled - reduces fragmentation-driven
+    # OOMs in long-running CUDA processes. Preserve any pre-existing user setting.
+    env = os.environ.copy()
+    prev = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in prev:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = (
+            (prev + ",") if prev else "") + "expandable_segments:True"
+
+    proc = subprocess.Popen(
+        cmd, cwd=streaming_dir, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    proc._tmp_cfg_path = tmp_cfg_path
+    return proc
+
+
+def collect_da3_streaming_outputs(streaming_out_dir, predictions_dir,
+                                  image_paths, save_fp16=False, status_cb=None):
+    """Convert DA3-Streaming's `results_output/*.npz` files to per-image `.pt`s
+    in `predictions_dir`, matching stems with `image_paths`.
+
+    Each npz contains keys like 'depth', 'rgb', 'conf', 'intrinsic'.
+    We save only depth (raw model output) so the rest of the pipeline (refine,
+    display) treats it identically to single-image predictions.
+    """
+    results_dir = os.path.join(streaming_out_dir, "results_output")
+    if not os.path.isdir(results_dir):
+        raise RuntimeError(f"DA3-Streaming results_output not found at {results_dir}. "
+                           "Did the streaming run complete? Check `save_depth_conf_result: True` in config.")
+    npz_files = sorted(glob.glob(os.path.join(results_dir, "*.npz")))
+    if not npz_files:
+        raise RuntimeError(f"No .npz files in {results_dir}.")
+
+    os.makedirs(predictions_dir, exist_ok=True)
+    # Map stems
+    stem_to_path = {os.path.splitext(os.path.basename(p))[0]: p for p in image_paths}
+    ok, fail = 0, 0
+    for k, npz_path in enumerate(npz_files):
+        stem = os.path.splitext(os.path.basename(npz_path))[0]
+        if stem not in stem_to_path:
+            # Frame names may differ if DA3 renumbered them; fall back to index match
+            pass
+        try:
+            data = np.load(npz_path)
+            depth = data["depth"] if "depth" in data.files else data[data.files[0]]
+            depth = np.asarray(depth, dtype=np.float32)
+            t = torch.from_numpy(depth).contiguous()
+            if save_fp16:
+                t = t.to(torch.float16)
+            out = os.path.join(predictions_dir, stem + ".pt")
+            torch.save(t, out)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if status_cb: status_cb(f"Failed on {os.path.basename(npz_path)}: {e}")
+        if status_cb and k % 25 == 0:
+            status_cb(f"Collecting outputs: {k+1}/{len(npz_files)}")
+    if status_cb:
+        status_cb(f"Collected {ok} .pt files ({fail} failed) -> {predictions_dir}")
+    return ok, fail
+
+
+def _downscale_dataset(src_dir, target_width, status_cb=None):
+    """Downscale all images in src_dir to target_width (preserving aspect).
+
+    Writes to a sibling folder named <basename>_downscaled_<W>/ next to src_dir.
+    Returns the path to the new folder. Idempotent: if the folder already
+    exists with the same image count, it's reused.
+    """
+    src_dir = os.path.abspath(src_dir.rstrip(os.sep))
+    parent = os.path.dirname(src_dir)
+    base = os.path.basename(src_dir)
+    out_dir = os.path.join(parent, f"{base}_downscaled_{target_width}")
+
+    src_files = []
+    for ext in IMAGE_EXTS:
+        src_files.extend(glob.glob(os.path.join(src_dir, f"*{ext}")))
+    src_files.sort()
+    if not src_files:
+        raise RuntimeError(f"No images found in {src_dir}")
+
+    # Reuse if already done
+    if os.path.isdir(out_dir):
+        existing = sum(
+            len(glob.glob(os.path.join(out_dir, f"*{ext}"))) for ext in IMAGE_EXTS)
+        if existing == len(src_files):
+            if status_cb: status_cb(f"Reusing existing downscaled dir ({existing} images)")
+            return out_dir
+
+    os.makedirs(out_dir, exist_ok=True)
+    for k, p in enumerate(src_files):
+        if status_cb and k % 50 == 0:
+            status_cb(f"Downscaling {k+1}/{len(src_files)} -> width={target_width}")
+        img = cv2.imread(p, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        if w == target_width:
+            cv2.imwrite(os.path.join(out_dir, os.path.basename(p)), img)
+            continue
+        new_h = int(round(h * target_width / w))
+        # Ensure even dimensions (some codecs / models care)
+        new_h -= new_h % 2
+        resized = cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(os.path.join(out_dir, os.path.basename(p)), resized)
+    if status_cb:
+        status_cb(f"Downscaled {len(src_files)} images -> {out_dir}")
+    return out_dir
 
 
 class GUIBase:
@@ -508,6 +1001,14 @@ class GUIBase:
         # Save options
         # ------------------------------------------------------------------ #
         self.save_fp16 = False
+
+        # ------------------------------------------------------------------ #
+        # Consistent batch (DA3-Streaming) state
+        # ------------------------------------------------------------------ #
+        self._da3stream_proc = None      # active subprocess.Popen, if any
+        self._da3stream_thread = None    # log-reader thread
+        self._da3stream_out_dir = None   # tmp output dir for the run
+        self._da3stream_log_lines = []   # rolling log buffer (last N)
 
         # ------------------------------------------------------------------ #
         # Misc
@@ -728,6 +1229,31 @@ class GUIBase:
     def _cb_load_model(self, sender, app_data):
         self.load_model(self.selected_model_name)
 
+    def _cb_unload_model(self, sender, app_data):
+        """Drop the loaded model and free its GPU memory.
+
+        Useful before running DA3-Streaming so the subprocess gets the full
+        VRAM budget instead of competing with model weights still resident
+        from the live Predict button.
+        """
+        if self.model is None:
+            dpg.set_value("_log_model_status", "No model loaded.")
+            return
+        try:
+            del self.model
+        except Exception:
+            pass
+        self.model = None
+        self.model_entry = None
+        # Best-effort VRAM cleanup
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        dpg.set_value("_log_model_status", "Unloaded model; VRAM freed.")
+        print("[gui] Unloaded model, called torch.cuda.empty_cache()", flush=True)
+
     def _cb_predict(self, sender, app_data):
         self.run_prediction()
 
@@ -916,6 +1442,155 @@ class GUIBase:
         except Exception as e:
             dpg.set_value("_log_basis_status", f"Load failed: {e}")
 
+    # -------------- Consistent batch (DA3-Streaming) callbacks --------------
+    def _da3stream_set_status(self, msg):
+        """Print full log to terminal, show last line in GUI status."""
+        msg = (msg or "").rstrip()
+        if not msg:
+            return
+        # Full message to terminal (flushed so it appears in real time)
+        print(f"[da3stream] {msg}", flush=True)
+        # GUI shows only a truncated single-line status
+        gui_msg = msg if len(msg) <= 90 else msg[:87] + "..."
+        if dpg.does_item_exist("_log_da3stream_status"):
+            dpg.set_value("_log_da3stream_status", gui_msg)
+
+    def _da3stream_log_reader(self, proc):
+        """Background thread: read subprocess stdout line by line and post to GUI."""
+        try:
+            for line in proc.stdout:
+                self._da3stream_set_status(line.rstrip())
+        except Exception as e:
+            self._da3stream_set_status(f"Log reader error: {e}")
+        proc.wait()
+        rc = proc.returncode
+        # Clean up the temp YAML config we wrote
+        tmp_cfg = getattr(proc, "_tmp_cfg_path", None)
+        if tmp_cfg and os.path.isfile(tmp_cfg):
+            try: os.unlink(tmp_cfg)
+            except Exception: pass
+        self._da3stream_set_status(f"Subprocess exited with code {rc}")
+        # If it succeeded, collect outputs into predictions/ and optionally refine.
+        if rc == 0 and self._da3stream_out_dir is not None:
+            try:
+                self._da3stream_collect_and_refine()
+            except Exception as e:
+                self._da3stream_set_status(f"Post-processing failed: {e}")
+
+    def _da3stream_collect_and_refine(self):
+        if not self.image_paths or not self.dataset_path:
+            self._da3stream_set_status("No dataset to map outputs to; skipping.")
+            return
+        # Output dir convention: predictions/ next to dataset
+        dataset_dir = os.path.abspath(self.dataset_path).rstrip(os.sep)
+        parent_dir = os.path.dirname(dataset_dir)
+        predictions_dir = os.path.join(parent_dir, "predictions")
+
+        collect_da3_streaming_outputs(
+            self._da3stream_out_dir, predictions_dir, self.image_paths,
+            save_fp16=self.save_fp16,
+            status_cb=self._da3stream_set_status,
+        )
+
+        # Optionally refine using COLMAP
+        if dpg.get_value("_chk_use_colmap"):
+            sparse_dir = dpg.get_value("_input_colmap_path").strip()
+            if not sparse_dir:
+                self._da3stream_set_status("COLMAP refinement on but no path given.")
+                return
+            try:
+                refine_depths_with_colmap(
+                    predictions_dir, self.image_paths, sparse_dir,
+                    status_cb=self._da3stream_set_status,
+                )
+            except Exception as e:
+                self._da3stream_set_status(f"COLMAP refine failed: {e}")
+
+    def _cb_run_consistent_batch(self, sender, app_data):
+        if self._da3stream_proc is not None and self._da3stream_proc.poll() is None:
+            self._da3stream_set_status("A run is already in progress.")
+            return
+        if not self.dataset_path or not os.path.isdir(self.dataset_path):
+            self._da3stream_set_status("Load a dataset first.")
+            return
+
+        chunk = int(dpg.get_value("_slider_chunk_size"))
+        ds_w = int(dpg.get_value("_input_downscale_width"))
+
+        # Optionally pre-downscale the dataset, then point DA3 at the new folder
+        image_dir_for_da3 = self.dataset_path
+        if ds_w > 0:
+            try:
+                image_dir_for_da3 = _downscale_dataset(
+                    self.dataset_path, ds_w,
+                    status_cb=self._da3stream_set_status,
+                )
+            except Exception as e:
+                self._da3stream_set_status(f"Downscale failed: {e}")
+                return
+
+        # Output to a temp dir under the (possibly downscaled) dataset's parent
+        parent = os.path.dirname(os.path.abspath(image_dir_for_da3).rstrip(os.sep))
+        out_dir = os.path.join(parent, "da3_streaming_out")
+        self._da3stream_out_dir = out_dir
+        # Stash the actual dir we fed to DA3 for the collect step
+        self._da3stream_input_dir = image_dir_for_da3
+        self._da3stream_log_lines = []
+        self._da3stream_set_status(
+            f"Starting DA3-Streaming (chunk={chunk}, downscale_w={ds_w if ds_w > 0 else 'off'})...")
+
+        try:
+            proc = run_da3_streaming(
+                image_dir=image_dir_for_da3,
+                out_dir=out_dir,
+                chunk_size=chunk,
+                log_cb=self._da3stream_set_status,
+            )
+        except Exception as e:
+            self._da3stream_set_status(f"Launch failed: {e}")
+            return
+
+        self._da3stream_proc = proc
+        self._da3stream_thread = threading.Thread(
+            target=self._da3stream_log_reader, args=(proc,), daemon=True)
+        self._da3stream_thread.start()
+
+    def _cb_stop_consistent_batch(self, sender, app_data):
+        proc = self._da3stream_proc
+        if proc is None or proc.poll() is not None:
+            self._da3stream_set_status("No active run.")
+            return
+        try:
+            proc.terminate()
+            self._da3stream_set_status("Sent terminate signal.")
+        except Exception as e:
+            self._da3stream_set_status(f"Terminate failed: {e}")
+
+    def _cb_refine_only(self, sender, app_data):
+        """Run COLMAP refinement on existing predictions/ without re-running DA3."""
+        if not self.dataset_path or not os.path.isdir(self.dataset_path):
+            self._da3stream_set_status("Load a dataset first.")
+            return
+        sparse_dir = dpg.get_value("_input_colmap_path").strip()
+        if not sparse_dir:
+            self._da3stream_set_status("Set COLMAP sparse/0 path first.")
+            return
+        parent = os.path.dirname(os.path.abspath(self.dataset_path).rstrip(os.sep))
+        predictions_dir = os.path.join(parent, "predictions")
+        if not os.path.isdir(predictions_dir):
+            self._da3stream_set_status(f"No predictions/ found at {predictions_dir}.")
+            return
+        # Run in a thread so the GUI stays responsive
+        def _go():
+            try:
+                refine_depths_with_colmap(
+                    predictions_dir, self.image_paths, sparse_dir,
+                    status_cb=self._da3stream_set_status,
+                )
+            except Exception as e:
+                self._da3stream_set_status(f"Refine failed: {e}")
+        threading.Thread(target=_go, daemon=True).start()
+
     # ====================================================================== #
     # Rendering
     # ====================================================================== #
@@ -1042,6 +1717,9 @@ class GUIBase:
                                callback=self._cb_load_model)
                 dpg.add_button(label="Predict", width=120,
                                callback=self._cb_predict)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Unload model (free VRAM)", width=-1,
+                               callback=self._cb_unload_model)
             dpg.add_button(label="Process all -> predictions/",
                            width=-1, callback=self._cb_process_all)
             with dpg.group(horizontal=True):
@@ -1071,6 +1749,35 @@ class GUIBase:
                                callback=self._cb_load_basis)
             dpg.add_text("basis: per-image (not locked)", tag="_log_basis_status")
             dpg.bind_item_theme("_btn_fit_basis", "_theme_btn_off")
+            dpg.add_separator()
+
+            # ---------------- Consistent batch (DA3-Streaming) ----------------
+            dpg.add_text("Consistent batch (DA3-Streaming)")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Chunk size:")
+                dpg.add_slider_int(tag="_slider_chunk_size",
+                                   default_value=60, min_value=30, max_value=120,
+                                   width=180)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Downscale W:")
+                dpg.add_input_int(tag="_input_downscale_width",
+                                  default_value=0, min_value=0, max_value=4096,
+                                  step=64, width=100)
+                dpg.add_text("(0 = off)")
+            dpg.add_input_text(tag="_input_colmap_path",
+                               default_value="", width=-1,
+                               hint="path to sparse/0/ (COLMAP .bin files)")
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="Refine with COLMAP",
+                                 tag="_chk_use_colmap", default_value=False)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Run consistent batch", width=180,
+                               callback=self._cb_run_consistent_batch)
+                dpg.add_button(label="Stop", width=60,
+                               callback=self._cb_stop_consistent_batch)
+            dpg.add_button(label="Refine existing only (no DA3 rerun)",
+                           width=-1, callback=self._cb_refine_only)
+            dpg.add_text("(idle - see terminal for full log)", tag="_log_da3stream_status")
             dpg.add_separator()
 
             dpg.add_text("Zoom")
