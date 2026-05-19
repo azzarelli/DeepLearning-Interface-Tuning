@@ -7,10 +7,21 @@ Core Features:
 - Save torch `.pth` with option for `fp16` for faster loading downstream
 
 Viewer Features:
-- Unified Drag & Zoom across all renders 
+- Unified Drag & Zoom across all renders
+- (dinov3) Predict a feature basis (PCA) for rendering view-consistent features for multi-view datasets
+- (dinov3) Save and Load feature basis
 
-![alt text](assets/viewer.png)
-![alt text](assets/controls.png)
+# Viewer Samples
+
+# For UniDepth
+![alt text](assets/depth.png)
+
+## For DINOv3
+Generic PCA Features
+![alt text](assets/dinov3.png)
+
+View-Consistent PCA Features
+![alt text](assets/dinov3_consistency.png)
 
 # Installation
 
@@ -20,7 +31,7 @@ This was tested on Linux with an RTX3090 and Cuda 12.4.
 conda env create -f environment.yml
 conda activate DLviewer
 
-# For UniDepth V2
+# For UniDepth V2 from root
 git clone https://github.com/lpiccinelli-eth/UniDepth.git
 cd UniDepth/
 pip install -e .
@@ -28,6 +39,13 @@ python ./scripts/demo.py
 
 ## Possible solution to issue with libstdc++.so
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+# For Dinov3 from root
+git clone https://github.com/facebookresearch/dinov3
+cd dinov3
+pip install -e .
+
+## You will need to wget the checkpoints and place then in `checkpoints/` for the vit s, b and l models 
 
 ```
 

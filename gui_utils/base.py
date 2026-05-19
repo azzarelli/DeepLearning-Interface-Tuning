@@ -109,6 +109,295 @@ MODEL_REGISTRY = [
 ]
 
 
+# --------------------------------------------------------------------------- #
+# DINOv3 backbones (loaded from local ./dinov3 clone, weights from
+# ./checkpoints/dinov3/dinov3_vit{s,b,l}16_pretrain_lvd1689m*.pth)
+# --------------------------------------------------------------------------- #
+# ImageNet normalization stats for LVD-1689M pretraining
+_DINO_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_DINO_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+# Patch size for all ViT/16 variants
+_DINO_PATCH = 16
+
+
+def _find_dinov3_weights(variant):
+    """Find a weight file for the given DINOv3 variant.
+
+    Searches ./checkpoints/dinov3/ for files matching
+    'dinov3_{variant}_pretrain_*.pth'. Returns the first match.
+    """
+    pattern = os.path.join("checkpoints", "dinov3",
+                           f"dinov3_{variant}_pretrain_*.pth")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        # Be lenient: also accept any pth in that folder containing the variant
+        matches = sorted(glob.glob(
+            os.path.join("checkpoints", "dinov3", f"*{variant}*.pth")))
+    return matches[0] if matches else None
+
+
+def _load_dinov3(device, variant="vits16"):
+    """Load a DINOv3 backbone via torch.hub from the local ./dinov3 clone."""
+    repo_dir = os.path.abspath("dinov3")
+    if not os.path.isdir(repo_dir):
+        raise RuntimeError(
+            f"DINOv3 repo not found at {repo_dir}. "
+            "Clone it into ./dinov3 (git clone https://github.com/facebookresearch/dinov3 dinov3).")
+
+    weights = _find_dinov3_weights(variant)
+    if weights is None:
+        raise RuntimeError(
+            f"No weights for dinov3_{variant} found in ./checkpoints/dinov3/. "
+            f"Expected something like 'dinov3_{variant}_pretrain_lvd1689m-XXXXXXXX.pth'.")
+
+    model = torch.hub.load(
+        repo_dir, f"dinov3_{variant}",
+        source="local", weights=weights,
+    )
+    model.to(device).eval()
+    return model
+
+
+def _pad_to_multiple(chw, m):
+    """Pad CHW tensor on bottom/right so H,W are multiples of m. Returns (padded, (pad_h, pad_w))."""
+    c, h, w = chw.shape
+    pad_h = (m - h % m) % m
+    pad_w = (m - w % m) % m
+    if pad_h == 0 and pad_w == 0:
+        return chw, (0, 0)
+    return torch.nn.functional.pad(chw, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
+
+
+@torch.no_grad()
+def _extract_dinov3_patches(model, chw_float01, device):
+    """Run DINOv3 on a single image and return (patch_tokens, h_tok, w_tok, H, W, pad).
+
+    patch_tokens: (N, D) float32 CPU tensor
+    """
+    c, H, W = chw_float01.shape
+    x = chw_float01.float()
+    x = (x - _DINO_MEAN) / _DINO_STD
+    x, (pad_h, pad_w) = _pad_to_multiple(x, _DINO_PATCH)
+    Hp, Wp = x.shape[1], x.shape[2]
+    h_tok, w_tok = Hp // _DINO_PATCH, Wp // _DINO_PATCH
+
+    x = x.unsqueeze(0).to(device)
+    with torch.autocast(device_type=("cuda" if device.type == "cuda" else "cpu"),
+                        dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+        feats_dict = model.forward_features(x)
+
+    if isinstance(feats_dict, dict) and "x_norm_patchtokens" in feats_dict:
+        patches = feats_dict["x_norm_patchtokens"]
+    elif isinstance(feats_dict, dict) and "x_patchtokens" in feats_dict:
+        patches = feats_dict["x_patchtokens"]
+    else:
+        patches = feats_dict if torch.is_tensor(feats_dict) else feats_dict[0]
+    patches = patches.squeeze(0).float().cpu()             # (N, D)
+    return patches, h_tok, w_tok, H, W, (pad_h, pad_w), (Hp, Wp)
+
+
+def _project_to_panels(proj_n9, h_tok, w_tok, H, W, pad, Hp_Wp, basis):
+    """Reshape (N, 9) projection -> upsampled 9xHxW image, then per-channel normalize.
+
+    `basis` provides the lo/hi percentiles for normalization. If basis.lo_hi is None,
+    falls back to per-image percentiles.
+    """
+    Hp, Wp = Hp_Wp
+    pad_h, pad_w = pad
+    feat_img = proj_n9.permute(1, 0).reshape(9, h_tok, w_tok)
+    feat_img = torch.nn.functional.interpolate(
+        feat_img.unsqueeze(0), size=(Hp, Wp),
+        mode="bilinear", align_corners=False,
+    ).squeeze(0)
+    if pad_h or pad_w:
+        feat_img = feat_img[:, :H, :W]
+
+    out = torch.zeros_like(feat_img)
+    if basis is not None and basis.lo_hi is not None:
+        # Use the locked normalization ranges for cross-frame consistency
+        for i in range(9):
+            lo, hi = basis.lo_hi[i]
+            if abs(hi - lo) < 1e-6:
+                hi = lo + 1e-6
+            out[i] = ((feat_img[i] - lo) / (hi - lo)).clamp(0, 1)
+    else:
+        for i in range(9):
+            ch = feat_img[i]
+            lo = torch.quantile(ch, 0.02)
+            hi = torch.quantile(ch, 0.98)
+            if (hi - lo).abs() < 1e-6:
+                hi = lo + 1e-6
+            out[i] = ((ch - lo) / (hi - lo)).clamp(0, 1)
+    return out
+
+
+class DINOPCABasis:
+    """Stores a locked PCA basis fitted on a sample of images.
+
+    Attributes:
+        mean: (1, D) - feature mean used for centering
+        V:    (D, 9) - top-9 principal components (orthonormal columns)
+        lo_hi: list of 9 (lo, hi) float tuples for per-component normalization
+        n_imgs: how many images contributed
+        variant: 'vits16' / 'vitb16' / 'vitl16'
+    """
+    __slots__ = ("mean", "V", "lo_hi", "n_imgs", "variant")
+
+    def __init__(self, mean, V, lo_hi, n_imgs, variant):
+        self.mean = mean
+        self.V = V
+        self.lo_hi = lo_hi
+        self.n_imgs = n_imgs
+        self.variant = variant
+
+    def save(self, path):
+        torch.save({
+            "mean":    self.mean,
+            "V":       self.V,
+            "lo_hi":   self.lo_hi,
+            "n_imgs":  self.n_imgs,
+            "variant": self.variant,
+        }, path)
+
+    @classmethod
+    def load(cls, path):
+        d = torch.load(path, map_location="cpu", weights_only=False)
+        return cls(d["mean"], d["V"], d["lo_hi"], d["n_imgs"], d["variant"])
+
+
+@torch.no_grad()
+def _fit_dinov3_basis(model, image_paths, device, variant,
+                      n_sample=32, status_cb=None):
+    """Sample images, run DINOv3, fit PCA basis (mean, V, normalization ranges).
+
+    Args:
+        model:        loaded DINOv3 backbone matching `variant`.
+        image_paths:  list of full paths to images in the dataset.
+        device:       torch device.
+        variant:      'vits16' / 'vitb16' / 'vitl16'.
+        n_sample:     number of images to sample (random, without replacement).
+        status_cb:    optional callable(str) to report progress.
+
+    Returns:
+        DINOPCABasis instance.
+    """
+    if not image_paths:
+        raise RuntimeError("No images to fit basis on.")
+    n = min(n_sample, len(image_paths))
+    rng = np.random.default_rng(0)
+    sample_idx = rng.choice(len(image_paths), size=n, replace=False)
+
+    feature_pool = []         # list of (Ni, D) tensors
+    projected_for_ranges = [] # list of (Ni, 9) - filled after V is known
+
+    for k, idx in enumerate(sample_idx):
+        path = image_paths[int(idx)]
+        if status_cb is not None:
+            status_cb(f"Fitting basis: extracting {k+1}/{n}")
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        chw = to_tensor(img)
+        patches, *_ = _extract_dinov3_patches(model, chw, device)
+        feature_pool.append(patches)
+
+    if not feature_pool:
+        raise RuntimeError("Failed to extract features from any sampled image.")
+
+    if status_cb is not None:
+        status_cb(f"Fitting basis: computing PCA on {len(feature_pool)} images...")
+
+    all_feats = torch.cat(feature_pool, dim=0)        # (sum_Ni, D)
+    mean = all_feats.mean(dim=0, keepdim=True)        # (1, D)
+    centered = all_feats - mean
+    # Same q=9 PCA, fitted once on the pooled feature set
+    U, S, V = torch.pca_lowrank(centered, q=9, center=False)   # V: (D, 9)
+
+    # Now project every sampled image's features through V to compute the
+    # per-component percentile ranges across the whole sample.
+    proj_all = centered @ V                            # (sum_Ni, 9)
+    lo_hi = []
+    for i in range(9):
+        col = proj_all[:, i]
+        lo = float(torch.quantile(col, 0.02))
+        hi = float(torch.quantile(col, 0.98))
+        lo_hi.append((lo, hi))
+
+    if status_cb is not None:
+        status_cb(f"Basis fitted on {len(feature_pool)} images.")
+
+    return DINOPCABasis(mean=mean, V=V, lo_hi=lo_hi,
+                        n_imgs=len(feature_pool), variant=variant)
+
+
+def _make_dinov3_predict(get_basis):
+    """Factory returning a predict() that uses get_basis() if available.
+
+    get_basis() should return either a DINOPCABasis or None (per-image PCA).
+    """
+    @torch.no_grad()
+    def _predict(model, chw_float01, device):
+        basis = get_basis()
+        patches, h_tok, w_tok, H, W, pad, hpwp = _extract_dinov3_patches(
+            model, chw_float01, device)
+
+        if basis is not None:
+            # Locked basis: center with stored mean, project through stored V.
+            centered = patches - basis.mean
+            proj = centered @ basis.V                  # (N, 9)
+        else:
+            # Per-image PCA (original behavior)
+            mean = patches.mean(dim=0, keepdim=True)
+            centered = patches - mean
+            U, S, V = torch.pca_lowrank(centered, q=9, center=False)
+            proj = centered @ V
+
+        return _project_to_panels(proj, h_tok, w_tok, H, W, pad, hpwp, basis)
+    return _predict
+
+
+# Module-level holder so the GUI can plug in a fitted basis without changing the
+# registry contract. Keyed nothing — only one DINOv3 basis active at a time.
+_DINOV3_BASIS = {"basis": None}
+
+
+def _get_dinov3_basis():
+    return _DINOV3_BASIS["basis"]
+
+
+def _set_dinov3_basis(b):
+    _DINOV3_BASIS["basis"] = b
+
+
+# A single predict callable used by all three ViT variants. Which variant
+# generated the basis (if locked) is enforced at fit time.
+_dinov3_predict = _make_dinov3_predict(_get_dinov3_basis)
+
+
+MODEL_REGISTRY.extend([
+    {
+        "name":    "DINOv3 PCA (ViT-S/16)",
+        "load":    lambda dev: _load_dinov3(dev, variant="vits16"),
+        "predict": _dinov3_predict,
+        "variant": "vits16",
+    },
+    {
+        "name":    "DINOv3 PCA (ViT-B/16)",
+        "load":    lambda dev: _load_dinov3(dev, variant="vitb16"),
+        "predict": _dinov3_predict,
+        "variant": "vitb16",
+    },
+    {
+        "name":    "DINOv3 PCA (ViT-L/16)",
+        "load":    lambda dev: _load_dinov3(dev, variant="vitl16"),
+        "predict": _dinov3_predict,
+        "variant": "vitl16",
+    },
+])
+
+
 def _colorize_depth(depth_hw, invert=True, cmap=cv2.COLORMAP_TURBO,
                     pct_lo=2.0, pct_hi=98.0):
     """Map a HxW float depth tensor to a CxHxW RGB tensor in [0,1].
@@ -185,7 +474,9 @@ class GUIBase:
         self.image_paths = []
         self.current_idx = 0
         self.current_image = None       # CHW float tensor [0,1]
-        self.prediction_image = None    # CHW float tensor [0,1] (display-ready)
+        self.prediction_image = None    # CHW float tensor [0,1] (top panel)
+        self.prediction_image_2 = None  # CHW float tensor [0,1] (mid panel, PC 4-6)
+        self.prediction_image_3 = None  # CHW float tensor [0,1] (bot panel, PC 7-9)
 
         # ------------------------------------------------------------------ #
         # Model state (registry-driven)
@@ -260,6 +551,18 @@ class GUIBase:
             self.model_entry = None
             dpg.set_value("_log_model_status", f"Load failed: {e}")
             print(f"[load_model] {e}")
+            return
+
+        # If a locked PCA basis exists from a different variant, clear it so
+        # we don't crash on a feature-dim mismatch on the next predict.
+        b = _get_dinov3_basis()
+        if b is not None and b.variant != entry.get("variant"):
+            _set_dinov3_basis(None)
+            dpg.set_value("_log_basis_status",
+                          f"basis cleared (was for {b.variant}, model is {entry.get('variant')})")
+        # Always sync the status indicator with reality
+        if dpg.does_item_exist("_log_basis_status"):
+            self._update_basis_status()
 
     @torch.no_grad()
     def run_prediction(self):
@@ -271,19 +574,27 @@ class GUIBase:
             return
         try:
             y = self.model_entry["predict"](self.model, self.current_image, self.device)
+            # Reset all three panels first (so a depth model clears stale PCA viz)
+            self.prediction_image_2 = None
+            self.prediction_image_3 = None
             # Normalize / colorize for display
             if torch.is_tensor(y) and y.ndim == 2:
-                # Single-channel output (depth, segmentation logits, ...): colorize
-                disp = _colorize_depth(y)
+                # Single-channel output (depth, etc.): colorize into top panel only
+                self.prediction_image = _colorize_depth(y)
             elif torch.is_tensor(y) and y.ndim == 3:
-                disp = y.float().clamp(0, 1)
-                if disp.shape[0] == 1:
-                    disp = disp.repeat(3, 1, 1)
-                elif disp.shape[0] > 3:
-                    disp = disp[:3]
+                y = y.float().clamp(0, 1)
+                if y.shape[0] == 1:
+                    self.prediction_image = y.repeat(3, 1, 1)
+                elif y.shape[0] == 9:
+                    # Split into PC 1-3, 4-6, 7-9 across the three side panels
+                    self.prediction_image   = y[0:3]
+                    self.prediction_image_2 = y[3:6]
+                    self.prediction_image_3 = y[6:9]
+                else:
+                    # Other multi-channel: clip to first 3
+                    self.prediction_image = y[:3]
             else:
                 raise ValueError(f"Unexpected prediction shape: {tuple(y.shape)}")
-            self.prediction_image = disp
             self._dirty = True
             dpg.set_value("_log_model_status", "Prediction OK")
         except Exception as e:
@@ -383,6 +694,8 @@ class GUIBase:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.current_image = to_tensor(img)
         self.prediction_image = None
+        self.prediction_image_2 = None
+        self.prediction_image_3 = None
         self._dirty = True
         dpg.set_value("_log_image_info",
                       f"[{self.current_idx + 1}/{len(self.image_paths)}] "
@@ -513,6 +826,96 @@ class GUIBase:
         theme = "_theme_btn_on" if self.save_fp16 else "_theme_btn_off"
         dpg.bind_item_theme("_btn_fp16", theme)
 
+    # -------------- DINOv3 PCA basis callbacks --------------
+    def _is_dinov3_loaded(self):
+        return (self.model is not None and self.model_entry is not None
+                and self.model_entry.get("variant") in ("vits16", "vitb16", "vitl16"))
+
+    def _update_basis_status(self):
+        b = _get_dinov3_basis()
+        if b is None:
+            dpg.set_value("_log_basis_status", "basis: per-image (not locked)")
+            dpg.bind_item_theme("_btn_fit_basis", "_theme_btn_off")
+        else:
+            dpg.set_value("_log_basis_status",
+                          f"basis: LOCKED on {b.n_imgs} imgs ({b.variant})")
+            dpg.bind_item_theme("_btn_fit_basis", "_theme_btn_on")
+
+    def _cb_fit_basis(self, sender, app_data):
+        if not self._is_dinov3_loaded():
+            dpg.set_value("_log_basis_status", "Load a DINOv3 model first.")
+            return
+        if not self.image_paths:
+            dpg.set_value("_log_basis_status", "Load a dataset first.")
+            return
+        n = int(dpg.get_value("_input_basis_sample"))
+        variant = self.model_entry["variant"]
+        try:
+            basis = _fit_dinov3_basis(
+                self.model, self.image_paths, self.device,
+                variant=variant, n_sample=n,
+                status_cb=lambda m: dpg.set_value("_log_basis_status", m),
+            )
+            _set_dinov3_basis(basis)
+            self._dirty = True
+        except Exception as e:
+            dpg.set_value("_log_basis_status", f"Fit failed: {e}")
+            print(f"[fit_basis] {e}")
+            return
+        self._update_basis_status()
+
+    def _cb_clear_basis(self, sender, app_data):
+        _set_dinov3_basis(None)
+        self._dirty = True
+        self._update_basis_status()
+
+    def _cb_save_basis(self, sender, app_data):
+        b = _get_dinov3_basis()
+        if b is None:
+            dpg.set_value("_log_basis_status", "No basis to save.")
+            return
+        # Save next to the dataset for portability
+        if self.dataset_path and os.path.isdir(self.dataset_path):
+            parent = os.path.dirname(os.path.abspath(self.dataset_path).rstrip(os.sep))
+            out = os.path.join(parent, f"dinov3_pca_basis_{b.variant}.pt")
+        else:
+            out = f"dinov3_pca_basis_{b.variant}.pt"
+        try:
+            b.save(out)
+            dpg.set_value("_log_basis_status", f"Saved -> {out}")
+        except Exception as e:
+            dpg.set_value("_log_basis_status", f"Save failed: {e}")
+
+    def _cb_load_basis(self, sender, app_data):
+        # Look for a matching basis file next to the dataset; fall back to cwd.
+        variant = self.model_entry["variant"] if self._is_dinov3_loaded() else None
+        candidates = []
+        if self.dataset_path and os.path.isdir(self.dataset_path):
+            parent = os.path.dirname(os.path.abspath(self.dataset_path).rstrip(os.sep))
+            if variant:
+                candidates.append(os.path.join(parent, f"dinov3_pca_basis_{variant}.pt"))
+            candidates.extend(sorted(glob.glob(os.path.join(parent, "dinov3_pca_basis_*.pt"))))
+        if variant:
+            candidates.append(f"dinov3_pca_basis_{variant}.pt")
+        candidates.extend(sorted(glob.glob("dinov3_pca_basis_*.pt")))
+
+        path = next((p for p in candidates if os.path.isfile(p)), None)
+        if path is None:
+            dpg.set_value("_log_basis_status",
+                          "No basis file found (expected dinov3_pca_basis_*.pt).")
+            return
+        try:
+            b = DINOPCABasis.load(path)
+            if variant and b.variant != variant:
+                dpg.set_value("_log_basis_status",
+                              f"Basis variant '{b.variant}' != loaded model '{variant}'.")
+                return
+            _set_dinov3_basis(b)
+            self._dirty = True
+            dpg.set_value("_log_basis_status", f"Loaded <- {os.path.basename(path)}")
+        except Exception as e:
+            dpg.set_value("_log_basis_status", f"Load failed: {e}")
+
     # ====================================================================== #
     # Rendering
     # ====================================================================== #
@@ -548,6 +951,14 @@ class GUIBase:
         self.buffer_pred[:] = self._apply_zoom(
             self.prediction_image, self.SIDE_H, self.SIDE_W)
         dpg.set_value("_tex_pred", self.buffer_pred)
+
+        self.buffer_aux1[:] = self._apply_zoom(
+            self.prediction_image_2, self.SIDE_H, self.SIDE_W)
+        dpg.set_value("_tex_aux1", self.buffer_aux1)
+
+        self.buffer_aux2[:] = self._apply_zoom(
+            self.prediction_image_3, self.SIDE_H, self.SIDE_W)
+        dpg.set_value("_tex_aux2", self.buffer_aux2)
 
         t1 = time.time()
         dt = t1 - t0
@@ -641,6 +1052,27 @@ class GUIBase:
             dpg.add_text("(no model loaded)", tag="_log_model_status")
             dpg.add_separator()
 
+            # ---------------- DINOv3 PCA basis controls ----------------
+            dpg.add_text("DINOv3 PCA basis")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Sample size:")
+                dpg.add_input_int(tag="_input_basis_sample", default_value=32,
+                                  min_value=2, max_value=512, width=80,
+                                  step=8, on_enter=False)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Fit basis", tag="_btn_fit_basis",
+                               width=120, callback=self._cb_fit_basis)
+                dpg.add_button(label="Clear basis", width=120,
+                               callback=self._cb_clear_basis)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Save", width=80,
+                               callback=self._cb_save_basis)
+                dpg.add_button(label="Load", width=80,
+                               callback=self._cb_load_basis)
+            dpg.add_text("basis: per-image (not locked)", tag="_log_basis_status")
+            dpg.bind_item_theme("_btn_fit_basis", "_theme_btn_off")
+            dpg.add_separator()
+
             dpg.add_text("Zoom")
             dpg.add_text("1.00x", tag="_log_zoom")
             dpg.add_button(label="Reset zoom", width=-1,
@@ -656,21 +1088,21 @@ class GUIBase:
                         width=self.SIDE_W, height=self.SIDE_H,
                         pos=[side_x, 0],
                         no_move=True, no_title_bar=True, no_scrollbar=True):
-            dpg.add_text("Prediction")
+            dpg.add_text("Prediction / PCA 1-3")
             dpg.add_image("_tex_pred", tag="_img_pred")
 
         with dpg.window(tag="_side_mid",
                         width=self.SIDE_W, height=self.SIDE_H,
                         pos=[side_x, self.SIDE_H],
                         no_move=True, no_title_bar=True, no_scrollbar=True):
-            dpg.add_text("Reserved")
+            dpg.add_text("PCA 4-6")
             dpg.add_image("_tex_aux1", tag="_img_aux1")
 
         with dpg.window(tag="_side_bot",
                         width=self.SIDE_W, height=self.SIDE_H,
                         pos=[side_x, 2 * self.SIDE_H],
                         no_move=True, no_title_bar=True, no_scrollbar=True):
-            dpg.add_text("Reserved")
+            dpg.add_text("PCA 7-9")
             dpg.add_image("_tex_aux2", tag="_img_aux2")
 
         with dpg.handler_registry():
