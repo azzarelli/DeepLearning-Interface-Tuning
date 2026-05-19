@@ -1,8 +1,10 @@
 # Viewer + DataProcessing for Various DeepLearning Models
+An interface for inference and automated dataset processing.
 
 Core Features:
 - Automate depth estimation over a large dataset
 - View and assess the model being interfaced
+- Save torch `.pth` with option for `fp16` for faster loading downstream
 
 Viewer Features:
 - Unified Drag & Zoom across all renders 
@@ -26,9 +28,14 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 ```
 
-# Installation
+# Run and Downstream Use
 Run with
 
 ```
 python gui_utils/base.py
+```
+
+To load the images efficiently onto the GPU in downstream applications, use:
+```
+torch.load(path, map_location='cuda', weights_only=True)
 ```

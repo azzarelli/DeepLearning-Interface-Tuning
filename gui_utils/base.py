@@ -205,6 +205,15 @@ class GUIBase:
         self.zoom_center = [0.5, 0.5]   # (u, v) in [0,1]
 
         # ------------------------------------------------------------------ #
+        # Drag state (left-mouse drag to pan)
+        # ------------------------------------------------------------------ #
+        self._drag_active = False
+        self._drag_panel_tag = None     # which image item the drag started on
+        self._drag_panel_size = (1, 1)  # rect size of that panel at drag start
+        self._drag_start_mouse = (0, 0)
+        self._drag_start_center = [0.5, 0.5]
+
+        # ------------------------------------------------------------------ #
         # Misc
         # ------------------------------------------------------------------ #
         self.save_frame = False
@@ -275,6 +284,59 @@ class GUIBase:
         except Exception as e:
             dpg.set_value("_log_model_status", f"Inference failed: {e}")
             print(f"[run_prediction] {e}")
+
+    @torch.no_grad()
+    def process_all(self):
+        """Run the loaded model on every image in the dataset and save raw outputs.
+
+        Outputs go to <parent_of_dataset_dir>/predictions/ as .npy files
+        (same stem as the source image). Raw model output is saved — NOT the
+        colorized display version — so you can post-process freely.
+        """
+        if self.model is None or self.model_entry is None:
+            dpg.set_value("_log_model_status", "No model loaded.")
+            return
+        if not self.image_paths:
+            dpg.set_value("_log_model_status", "No dataset loaded.")
+            return
+
+        # Output dir: parent of the dataset dir / predictions
+        dataset_dir = os.path.abspath(self.dataset_path).rstrip(os.sep)
+        parent_dir = os.path.dirname(dataset_dir)
+        out_dir = os.path.join(parent_dir, "predictions")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"[process_all] Saving to {out_dir}")
+
+        n = len(self.image_paths)
+        ok = 0
+        fail = 0
+        t_start = time.time()
+
+        for i, path in enumerate(self.image_paths):
+            dpg.set_value("_log_model_status",
+                          f"Processing {i+1}/{n}: {os.path.basename(path)}")
+            # Force a redraw of the status line each frame, even though we're
+            # inside a callback — DPG batches set_value updates, but the user
+            # at least sees the final state.
+            try:
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise IOError("cv2.imread returned None")
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                chw = to_tensor(img)
+                y = self.model_entry["predict"](self.model, chw, self.device)
+                arr = y.detach().cpu().numpy() if torch.is_tensor(y) else np.asarray(y)
+                stem = os.path.splitext(os.path.basename(path))[0]
+                np.save(os.path.join(out_dir, stem + ".npy"), arr)
+                ok += 1
+            except Exception as e:
+                print(f"[process_all] {path}: {e}")
+                fail += 1
+
+        dt = time.time() - t_start
+        msg = f"Done: {ok} saved, {fail} failed, {dt:.1f}s -> {out_dir}"
+        print(f"[process_all] {msg}")
+        dpg.set_value("_log_model_status", msg)
 
     # ====================================================================== #
     # Dataset handling
@@ -379,6 +441,60 @@ class GUIBase:
                 self._dirty = True
                 break
 
+    def _cb_mouse_down(self, sender, app_data):
+        """Begin a drag on left-button press over any image panel."""
+        # app_data for mouse_down handler is [button, duration]; button 0 = left
+        button = app_data[0] if isinstance(app_data, (list, tuple)) else app_data
+        if button != 0:
+            return
+        if self._drag_active:
+            return
+        for tag in ("_img_main", "_img_pred", "_img_aux1", "_img_aux2"):
+            if not dpg.does_item_exist(tag):
+                continue
+            if dpg.is_item_hovered(tag):
+                self._drag_active = True
+                self._drag_panel_tag = tag
+                self._drag_panel_size = tuple(dpg.get_item_rect_size(tag))
+                self._drag_start_mouse = tuple(dpg.get_mouse_pos(local=False))
+                self._drag_start_center = list(self.zoom_center)
+                break
+
+    def _cb_mouse_drag(self, sender, app_data):
+        """Pan the zoom window while the left button is held."""
+        if not self._drag_active:
+            return
+        # No need to recompute hover; we track the panel from mouse-down.
+        mx, my = dpg.get_mouse_pos(local=False)
+        sx, sy = self._drag_start_mouse
+        pw, ph = self._drag_panel_size
+        # Pixels moved -> fraction of the panel -> fraction of the zoom window
+        # (zoom window width in image-space coords is 1/zoom).
+        du_screen = (mx - sx) / max(pw, 1)
+        dv_screen = (my - sy) / max(ph, 1)
+        # Dragging right should move the view content right, which means the
+        # zoom center moves LEFT in image coords -> negate.
+        du_img = -du_screen / self.zoom
+        dv_img = -dv_screen / self.zoom
+
+        half = 0.5 / self.zoom
+        new_cx = self._drag_start_center[0] + du_img
+        new_cy = self._drag_start_center[1] + dv_img
+        self.zoom_center = [
+            float(np.clip(new_cx, half, 1 - half)),
+            float(np.clip(new_cy, half, 1 - half)),
+        ]
+        self._dirty = True
+
+    def _cb_mouse_release(self, sender, app_data):
+        button = app_data if not isinstance(app_data, (list, tuple)) else app_data[0]
+        if button == 0:
+            self._drag_active = False
+            self._drag_panel_tag = None
+
+    def _cb_process_all(self, sender, app_data):
+        self.process_all()
+
     # ====================================================================== #
     # Rendering
     # ====================================================================== #
@@ -481,6 +597,8 @@ class GUIBase:
                                callback=self._cb_load_model)
                 dpg.add_button(label="Predict", width=120,
                                callback=self._cb_predict)
+            dpg.add_button(label="Process all -> predictions/",
+                           width=-1, callback=self._cb_process_all)
             dpg.add_text("(no model loaded)", tag="_log_model_status")
             dpg.add_separator()
 
@@ -518,6 +636,9 @@ class GUIBase:
 
         with dpg.handler_registry():
             dpg.add_mouse_wheel_handler(callback=self._cb_mouse_wheel)
+            dpg.add_mouse_down_handler(callback=self._cb_mouse_down)
+            dpg.add_mouse_drag_handler(callback=self._cb_mouse_drag, threshold=0.0)
+            dpg.add_mouse_release_handler(callback=self._cb_mouse_release)
 
         total_w = self.MAIN_W + self.CTRL_W + self.SIDE_W
         total_h = self.MAIN_H + (45 if os.name == "nt" else 0)
