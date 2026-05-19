@@ -9,6 +9,9 @@ Core Features:
 Viewer Features:
 - Unified Drag & Zoom across all renders 
 
+![alt text](assets/viewer.png)
+![alt text](assets/controls.png)
+
 # Installation
 
 This was tested on Linux with an RTX3090 and Cuda 12.4.
