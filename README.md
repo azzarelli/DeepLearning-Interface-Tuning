@@ -25,3 +25,10 @@ python ./scripts/demo.py
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 ```
+
+# Installation
+Run with
+
+```
+python gui_utils/base.py
+```
