@@ -436,7 +436,7 @@ def _predict_da3(model, chw_float01, device):
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         cv2.imwrite(tmp.name, bgr)
         try:
-            pred = model.inference(images=[tmp.name])
+            pred = model.inference([tmp.name])
         finally:
             try: os.unlink(tmp.name)
             except Exception: pass
@@ -880,23 +880,23 @@ def collect_da3_streaming_outputs(streaming_out_dir, predictions_dir,
 
 
 def _downscale_dataset(src_dir, target_width, status_cb=None):
-    """Downscale all images in src_dir to target_width (preserving aspect).
+    """Downscale all images in src_dir (recursively) to target_width.
 
-    Writes to a sibling folder named <basename>_downscaled_<W>/ next to src_dir.
-    Returns the path to the new folder. Idempotent: if the folder already
-    exists with the same image count, it's reused.
+    Writes flat into <basename>_downscaled_<W>/ next to src_dir. Idempotent:
+    reuses an existing dir if the image count already matches.
     """
     src_dir = os.path.abspath(src_dir.rstrip(os.sep))
     parent = os.path.dirname(src_dir)
     base = os.path.basename(src_dir)
     out_dir = os.path.join(parent, f"{base}_downscaled_{target_width}")
 
+    # Recurse, mirroring how the GUI's dataset loader collects images
     src_files = []
     for ext in IMAGE_EXTS:
-        src_files.extend(glob.glob(os.path.join(src_dir, f"*{ext}")))
+        src_files.extend(glob.glob(os.path.join(src_dir, f"**/*{ext}"), recursive=True))
     src_files.sort()
     if not src_files:
-        raise RuntimeError(f"No images found in {src_dir}")
+        raise RuntimeError(f"No images found (recursively) under {src_dir}")
 
     # Reuse if already done
     if os.path.isdir(out_dir):
@@ -1494,10 +1494,12 @@ class GUIBase:
 
         # Optionally refine using COLMAP
         if dpg.get_value("_chk_use_colmap"):
-            sparse_dir = dpg.get_value("_input_colmap_path").strip()
-            if not sparse_dir:
-                self._da3stream_set_status("COLMAP refinement on but no path given.")
+            sparse_dir = self._resolve_colmap_path()
+            if sparse_dir is None:
+                self._da3stream_set_status(
+                    "COLMAP sparse/0 not found next to dataset. Expected <dataset_parent>/sparse/0/.")
                 return
+            self._da3stream_set_status(f"Using COLMAP: {sparse_dir}")
             try:
                 refine_depths_with_colmap(
                     predictions_dir, self.image_paths, sparse_dir,
@@ -1505,6 +1507,28 @@ class GUIBase:
                 )
             except Exception as e:
                 self._da3stream_set_status(f"COLMAP refine failed: {e}")
+
+    def _resolve_colmap_path(self):
+        """Auto-derive the COLMAP sparse dir from the dataset path.
+
+        Convention: dataset is <root>/images/, COLMAP at <root>/sparse/0/.
+        Falls back to a few other common layouts. Returns absolute path, or None
+        if cameras.bin isn't found anywhere expected.
+        """
+        if not self.dataset_path:
+            return None
+        d = os.path.abspath(self.dataset_path).rstrip(os.sep)
+        root = os.path.dirname(d)   # parent of `images/`
+        candidates = [
+            os.path.join(root, "sparse", "0"),
+            os.path.join(root, "sparse"),
+            os.path.join(d, "sparse", "0"),
+            os.path.join(d, "sparse"),
+        ]
+        for c in candidates:
+            if os.path.isfile(os.path.join(c, "cameras.bin")):
+                return c
+        return None
 
     def _cb_run_consistent_batch(self, sender, app_data):
         if self._da3stream_proc is not None and self._da3stream_proc.poll() is None:
@@ -1571,10 +1595,12 @@ class GUIBase:
         if not self.dataset_path or not os.path.isdir(self.dataset_path):
             self._da3stream_set_status("Load a dataset first.")
             return
-        sparse_dir = dpg.get_value("_input_colmap_path").strip()
-        if not sparse_dir:
-            self._da3stream_set_status("Set COLMAP sparse/0 path first.")
+        sparse_dir = self._resolve_colmap_path()
+        if sparse_dir is None:
+            self._da3stream_set_status(
+                "COLMAP sparse/0 not found next to dataset. Expected <dataset_parent>/sparse/0/.")
             return
+        self._da3stream_set_status(f"Using COLMAP: {sparse_dir}")
         parent = os.path.dirname(os.path.abspath(self.dataset_path).rstrip(os.sep))
         predictions_dir = os.path.join(parent, "predictions")
         if not os.path.isdir(predictions_dir):
@@ -1764,11 +1790,8 @@ class GUIBase:
                                   default_value=0, min_value=0, max_value=4096,
                                   step=64, width=100)
                 dpg.add_text("(0 = off)")
-            dpg.add_input_text(tag="_input_colmap_path",
-                               default_value="", width=-1,
-                               hint="path to sparse/0/ (COLMAP .bin files)")
             with dpg.group(horizontal=True):
-                dpg.add_checkbox(label="Refine with COLMAP",
+                dpg.add_checkbox(label="Refine with COLMAP (auto-find sparse/0)",
                                  tag="_chk_use_colmap", default_value=False)
             with dpg.group(horizontal=True):
                 dpg.add_button(label="Run consistent batch", width=180,

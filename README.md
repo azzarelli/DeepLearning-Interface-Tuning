@@ -13,7 +13,8 @@ Viewer Features:
 
 # Viewer Samples
 
-# For UniDepth
+## For UniDepth
+Depth estimate example:
 ![alt text](assets/depth.png)
 
 ## For DINOv3
@@ -22,6 +23,32 @@ Generic PCA Features
 
 View-Consistent PCA Features
 ![alt text](assets/dinov3_consistency.png)
+
+## For DepthAnythingv3
+Depth estimate:
+![alt text](assets/depthany.png)
+
+## Control Panel
+The control panel includes:
+1. Load image folder by path
+2. Browsing controls
+3. Model selection with
+    1. Loading/Unloading models
+    2. Saving `fp16` for compactness
+    3. Propagate predictions for every image
+4. DINOv3 basis generation with
+    1. Basis shape control 
+    2. Save/Load Basis from dataset
+5. DepthAnythingv3 streaming controls
+    1. Chunk/window size (as DAv3 does not work efficiently on long high-res videos)
+    2. Image downscaling factor
+    3. Option for depth refinement with COLMAP inputs
+    4. Run/Refine the predictions
+5. Viewing/Reset the zoom
+6. Viewing the FPS
+
+![alt text](assets/controls.png)
+
 
 # Installation
 
